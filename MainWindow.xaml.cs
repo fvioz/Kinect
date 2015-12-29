@@ -1,13 +1,19 @@
 ﻿using Microsoft.Kinect;
+using Kinect.Toolbox;
 using System.IO;
+using System.Speech.Synthesis;
+using System.Speech.Recognition;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 
-namespace Kinect {
+namespace Kinect
+{
 
     public partial class MainWindow : Window {
 
+        private System.Speech.Recognition.SpeechRecognitionEngine engine = new SpeechRecognitionEngine();
+        private SpeechSynthesizer synthesizer = new SpeechSynthesizer();
         private KinectSensor sensor;
         private WriteableBitmap bitmap;
         private DepthImagePixel[] depthPixels;
@@ -25,6 +31,11 @@ namespace Kinect {
         private readonly Brush inferredJointBrush = Brushes.Yellow;
         private readonly Pen trackedBonePen = new Pen(Brushes.Green, 6);
         private readonly Pen inferredBonePen = new Pen(Brushes.Gray, 1);
+
+        private bool disableSkel = false;
+
+        private SwipeGestureDetector swipeGestureRecognizer;
+        TemplatedGestureDetector circleGestureRecognizer;
 
 
         public MainWindow() {
@@ -45,6 +56,19 @@ namespace Kinect {
             }
 
             InitializeScan();
+            InitializeSpeech();
+        }
+
+        private void InitializeSpeech()
+        {
+
+            engine.SetInputToDefaultAudioDevice();
+            engine.UpdateRecognizerSetting("CFGConfidenceRejectionThreshold", 70);
+
+            LoadAllGrammars();
+
+            engine.RecognizeAsync(RecognizeMode.Multiple);
+            engine.SpeechRecognized += new System.EventHandler<SpeechRecognizedEventArgs>(engineSpeechRecognizer);
         }
 
         private void InitializeScan() {
@@ -53,6 +77,7 @@ namespace Kinect {
                 InitializeColorSensor();
                 InitializeDepthSensor();
                 InitializeSkeletonSensor();
+                InitializeGestures();
 
                 try {
                     this.sensor.Start();
@@ -61,6 +86,98 @@ namespace Kinect {
                 }
             }
         }
+
+        // SPEECH
+        void engineSpeechRecognizer(object sender, SpeechRecognizedEventArgs e)
+        {
+            SemanticValue semantics = e.Result.Semantics;
+            string rawText = e.Result.Text;
+
+            if (semantics.ContainsKey("action") || semantics.ContainsKey("command"))
+            {
+
+                string command = (string)semantics["command"].Value;
+
+                switch (command) {
+                    case "Color":
+                        this.comboBox.SelectedIndex = 0;
+                    break;
+
+                    case "Depth":
+                        this.comboBox.SelectedIndex = 1;
+                    break;
+
+
+                    case "Skeleton":
+                        this.comboBox.SelectedIndex = 2;
+                    break;
+                }
+            }
+        }
+
+
+        // GRAMMARS 
+        private void LoadAllGrammars()
+        {
+            engine.UnloadAllGrammars();
+
+            Grammar actiosGrammar = ActionsGrammar();
+            actiosGrammar.Enabled = true;
+            engine.LoadGrammar(actiosGrammar);
+        }
+
+        private Grammar ActionsGrammar()
+        {
+            // Actions Grammar
+            var actions = new Choices();
+            string[] action_options = new string[] {"Show", "Switch" };
+            for (var i = 0; i < action_options.Length; i++)
+            {
+                SemanticResultValue choiceResultValue = new SemanticResultValue(action_options[i], action_options[i]);
+                GrammarBuilder resultValueBuilder = new GrammarBuilder(choiceResultValue);
+                actions.Add(resultValueBuilder);
+            }
+            SemanticResultKey resultKeyActions = new SemanticResultKey("action", actions);
+            GrammarBuilder actionsGrammar = new GrammarBuilder(resultKeyActions);
+
+            // Commands Grammar
+            var commands = new Choices();
+            string[] command_options = new string[] {"Color", "Depth", "Skeleton"};
+            for (var i = 0; i < command_options.Length; i++)
+            {
+                SemanticResultValue choiceResultValue = new SemanticResultValue(command_options[i], command_options[i]);
+                GrammarBuilder resultValueBuilder = new GrammarBuilder(choiceResultValue);
+                commands.Add(resultValueBuilder);
+            }
+            SemanticResultKey resultKeyCommands = new SemanticResultKey("command", commands);
+            GrammarBuilder commandsGrammar = new GrammarBuilder(resultKeyCommands);
+        
+            actionsGrammar.Append(commandsGrammar);
+
+            Grammar grammar = new Grammar(actionsGrammar);
+            grammar.Name = "Change the select box";
+            return grammar;
+        }
+
+        // GESTURES
+        private void OnGestureDetected(string gesture)
+        {
+
+            this.statusText.Text = gesture;
+
+            System.Console.WriteLine(gesture);
+            System.Console.WriteLine(this.disableSkel);
+            switch (gesture) {
+                case "SwipeToLeft":
+                    this.comboBox.SelectedIndex = (this.comboBox.SelectedIndex != 0) ? 0 : 1;
+                break;
+
+                case "Circle":
+                    this.disableSkel = (this.disableSkel == true) ? false : true; 
+                break;
+            }
+        }
+
 
         // Draw Methods
         private void Draw() {
@@ -77,6 +194,18 @@ namespace Kinect {
                         this.imageBox.Source = this.imageSource;
                     }
                 break;
+            }
+        }
+
+        // Gestures 
+        private void InitializeGestures() {
+            swipeGestureRecognizer = new SwipeGestureDetector();
+            swipeGestureRecognizer.OnGestureDetected += OnGestureDetected;
+
+            using (Stream recordStream = File.Open("../../circleKB.save", FileMode.Open))
+            {
+                circleGestureRecognizer = new TemplatedGestureDetector("Circle", recordStream);
+                circleGestureRecognizer.OnGestureDetected += OnGestureDetected;
             }
         }
 
@@ -143,22 +272,36 @@ namespace Kinect {
         }
 
         private void SensorSkeletonFrameReady(object sender, SkeletonFrameReadyEventArgs e) {
-            if (this.comboBox.SelectedIndex != 2) return;
-
+            
             Skeleton[] skeletons = new Skeleton[0];
 
             using (SkeletonFrame skeletonFrame = e.OpenSkeletonFrame()) {
                 if (skeletonFrame != null) {
                     skeletons = new Skeleton[skeletonFrame.SkeletonArrayLength];
                     skeletonFrame.CopySkeletonDataTo(skeletons);
+
+                    foreach (Joint joint in skeletons[0].Joints)
+                    {
+                        if (joint.JointType == JointType.HandLeft)
+                        {
+                            swipeGestureRecognizer.Add(joint.Position, sensor);
+                        }
+
+                        if (joint.JointType == JointType.HandRight)
+                        {
+                            circleGestureRecognizer.Add(joint.Position, sensor);
+                        }
+                    }
                 }
             }
+
+            if (this.comboBox.SelectedIndex != 2) return;
 
             using (DrawingContext dc = this.drawingGroup.Open()) {
                 // Draw a transparent background to set the render size
                 dc.DrawRectangle(Brushes.Black, null, new Rect(0.0, 0.0, RenderWidth, RenderHeight));
 
-                if (skeletons.Length != 0)
+                if (skeletons.Length != 0 && this.disableSkel == false)
                 {
                     foreach (Skeleton skel in skeletons)
                     {
@@ -166,14 +309,14 @@ namespace Kinect {
 
                         if (skel.TrackingState == SkeletonTrackingState.Tracked)
                         {
-                            this.DrawBonesAndJoints(skel, dc);
+                            DrawBonesAndJoints(skel, dc);
                         }
                         else if (skel.TrackingState == SkeletonTrackingState.PositionOnly)
                         {
                             dc.DrawEllipse(
                             this.centerPointBrush,
                             null,
-                            this.SkeletonPointToScreen(skel.Position),
+                            SkeletonPointToScreen(skel.Position),
                             BodyCenterThickness,
                             BodyCenterThickness);
                         }
@@ -272,10 +415,6 @@ namespace Kinect {
                 }
             }
 
-
-
-
-            // UTILIZAR ESTA PRIMITIVA PARA EL DIBUJADO DE LA ELIPSE
         }
 
         private Point SkeletonPointToScreen(SkeletonPoint skelpoint) {
